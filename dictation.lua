@@ -20,12 +20,11 @@ require("hs.ipc") -- enables the `hs -c '...'` CLI bridge from Terminal, for deb
 local GROQ_URL     = "https://api.groq.com/openai/v1/audio/transcriptions"
 local GROQ_KEYFILE = os.getenv("HOME") .. "/.config/dictation-groq-key"
 local GROQ_MODEL   = "whisper-large-v3" -- best Hebrew accuracy Groq offers; turbo is faster but weaker
--- nil = let Whisper detect the language per recording. Measured: on Hebrew this is identical to
--- forcing "he" (5/5 test sentences byte-for-byte the same), but forcing "he" turns spoken English
--- into nonsense - "Can you send me the quarterly report" came back as "תכנן לנסות לי את הפרק
--- המקומי". Auto costs nothing and makes the hotkey work in either language.
--- Set to a code like "he" only if detection ever picks the wrong language on you.
-local LANGUAGE     = nil
+-- Pinned to Hebrew on purpose. ~99% of dictation here is Hebrew, and auto-detect (LANGUAGE = nil)
+-- made real-world Hebrew accuracy worse: Whisper sometimes guesses wrong mid-recording and the
+-- output degrades. Pinning "he" is the reliable default. Set to nil (or another ISO-639-1 code)
+-- only if you actually need to dictate in another language.
+local LANGUAGE     = "he"
 
 -- Whisper's `prompt` biases its vocabulary toward these words. Measured on Hebrew test audio:
 -- without it, tech jargon came out mangled (באג→בואג, צ׳קאאוט→צ'יקאות, "הדיפלוי לפרודקשן"→
