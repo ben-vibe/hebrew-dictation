@@ -1,0 +1,10 @@
+# never commit a key
+*dictation-groq-key*
+*dictation-elevenlabs-key*
+# compiled recorder
+bin/dictation-recorder
+*.dSYM/
+# captured audio
+recordings/
+*.wav
+.DS_Store
