@@ -20,7 +20,12 @@ require("hs.ipc") -- enables the `hs -c '...'` CLI bridge from Terminal, for deb
 local GROQ_URL     = "https://api.groq.com/openai/v1/audio/transcriptions"
 local GROQ_KEYFILE = os.getenv("HOME") .. "/.config/dictation-groq-key"
 local GROQ_MODEL   = "whisper-large-v3" -- best Hebrew accuracy Groq offers; turbo is faster but weaker
-local LANGUAGE     = "he"
+-- nil = let Whisper detect the language per recording. Measured: on Hebrew this is identical to
+-- forcing "he" (5/5 test sentences byte-for-byte the same), but forcing "he" turns spoken English
+-- into nonsense - "Can you send me the quarterly report" came back as "תכנן לנסות לי את הפרק
+-- המקומי". Auto costs nothing and makes the hotkey work in either language.
+-- Set to a code like "he" only if detection ever picks the wrong language on you.
+local LANGUAGE     = nil
 
 -- Whisper's `prompt` biases its vocabulary toward these words. Measured on Hebrew test audio:
 -- without it, tech jargon came out mangled (באג→בואג, צ׳קאאוט→צ'יקאות, "הדיפלוי לפרודקשן"→
@@ -33,7 +38,8 @@ local LANGUAGE     = "he"
 -- Add your own recurring vocabulary here (product names, client names, colleagues' names).
 local VOCAB_PROMPT = "שיחה על פיתוח תוכנה. מונחים נפוצים: הבאג, באגים, דיפלוי, פרודקשן, " ..
     "סטייג׳ינג, קומפוננטה, צ׳קאאוט, ריפו, פוש, מרג׳, ברנץ׳, קומיט, סרבר, דאטהבייס, " ..
-    "אנדפוינט, פיצ׳ר, ריפקטור, טסטים, איי־פי־איי, פרונטאנד, בקאנד."
+    "אנדפוינט, פיצ׳ר, ריפקטור, טסטים, איי־פי־איי, פרונטאנד, בקאנד, גיטהאב, " ..
+    "פול ריקווסט, קומפוננטה, לוקאלי, קונפיג, לוג, סקריפט."
 local REC_FILE       = "/tmp/hs-dictation.wav"
 local RECORDER       = os.getenv("HOME") .. "/.hammerspoon/bin/dictation-recorder"
 local MIN_HOLD_SECS  = 0.35 -- ignore accidental taps shorter than this
@@ -62,6 +68,11 @@ local function log(msg)
     table.insert(_G.dictationLog, os.date("%H:%M:%S") .. " " .. msg)
     if #_G.dictationLog > 200 then table.remove(_G.dictationLog, 1) end
 end
+
+-- Held at module scope on purpose. A timer that only exists inside a closure can be garbage
+-- collected before it fires, which made the upload silently never happen on some dictations while
+-- working fine on others - the worst kind of bug, because it looks intermittent rather than broken.
+local pollTimer = nil
 
 local primed = false       -- mic opened on a single modifier key, combo not yet completed
 local isRecording = false  -- both Ctrl+Shift confirmed down - a real dictation is in progress
@@ -163,6 +174,17 @@ local function sendToGroq()
         return
     end
 
+    local curlArgs = { "-s", "-X", "POST", GROQ_URL,
+        "-H", "Authorization: Bearer " .. apiKey,
+        "-F", "file=@" .. REC_FILE,
+        "-F", "model=" .. GROQ_MODEL,
+        "-F", "prompt=" .. VOCAB_PROMPT,
+        "-F", "response_format=json" }
+    if LANGUAGE then -- omitted entirely = Whisper auto-detects
+        table.insert(curlArgs, "-F")
+        table.insert(curlArgs, "language=" .. LANGUAGE)
+    end
+
     local curlTask = hs.task.new(
         "/usr/bin/curl",
         function(exitCode, stdOut, stdErr)
@@ -207,13 +229,7 @@ local function sendToGroq()
                 end
             end)
         end,
-        { "-s", "-X", "POST", GROQ_URL,
-          "-H", "Authorization: Bearer " .. apiKey,
-          "-F", "file=@" .. REC_FILE,
-          "-F", "model=" .. GROQ_MODEL,
-          "-F", "language=" .. LANGUAGE,
-          "-F", "prompt=" .. VOCAB_PROMPT,
-          "-F", "response_format=json" }
+        curlArgs
     )
     curlTask:start()
     archiveRecordingAsync() -- after the upload is in flight, never before it
@@ -300,13 +316,14 @@ local function stopRecordingAndTranscribe()
         local size = attrs and attrs.size or 0
         -- Ready once the file has stopped growing at a plausible size, or we run out of patience.
         if (size > 1000 and size == lastSize) or hs.timer.secondsSinceEpoch() > deadline then
+            pollTimer = nil
             sendToGroq()
             return
         end
         lastSize = size
-        hs.timer.doAfter(0.03, poll)
+        pollTimer = hs.timer.doAfter(0.03, poll)
     end
-    hs.timer.doAfter(0.03, poll)
+    pollTimer = hs.timer.doAfter(0.03, poll)
 end
 
 local function isExactFnShift(flags)
