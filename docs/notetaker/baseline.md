@@ -20,8 +20,30 @@ never committed: they contain file hashes, including hashes of credential files.
 Observed in the live dictation log: a 9.6 s dictation took 1.77 s from release to paste. The
 ~0.6 s figure applies to short dictations.
 
-## Live dictation smoke test
+## Live dictation smoke test (2026-10-29): inconclusive
 
-**Pending. Needs the owner at the Mac.** `dictation-smoke.sh --save-baseline` speaks 3 Hebrew
-sentences through the speakers into the real dictation path. It records character error rate and
-release-to-paste latency per sentence, and becomes the reference for later regression runs.
+Two runs of `dictation-smoke.sh --save-baseline` played synthetic Hebrew speech (`say -v Carmit`)
+from the MacBook speakers into its microphone, then drove the real dictation path. Recordings were
+backed up and checksum-verified first. After each run the mic was confirmed closed and dictation idle.
+
+**Every clip that actually contained speech was transcribed and pasted correctly and quickly:**
+
+| Run, sentence | Audio captured | CER | Release to paste |
+|---|---|---|---|
+| 1, s2 | 6.1 s, mean −43 dB | 0.103 | 0.68 s |
+| 1, s3 | 6.9 s | 0.000 | 0.67 s |
+| 2, s1 | 7.2 s, mean −33 dB | 0.025 | 0.77 s |
+
+**The speaker-to-mic test harness was unreliable:** 4 of 6 utterances failed before reaching
+dictation.
+- In 3 of them, the output was cut short or inaudible: 0.5–1.8 s captured, or a full clip at
+  about −53 dB. Whisper then hallucinated "תודה", a known silence artifact.
+- In one, the Hammerspoon CLI stalled for 5 s during the script's log polling, which delayed that
+  paste to 5.76 s.
+
+Neither run is kept as the reference: both are marked invalid.
+
+**Next:** make the smoke test independent of acoustics. One option is a guided mode where the
+owner reads the three sentences aloud using the real fn+Shift hotkey, which also covers the
+hotkey path. Also add a `say` duration check and slower log polling. These go through the usual
+builder/verifier review.
