@@ -306,96 +306,409 @@ t=smoke_helper_self_test
 set +e; sout="$(bash "$here/dictation-smoke.sh" --helper-self-test 2>&1)"; rc=$?; set -e
 if [ $rc -eq 0 ] && ! grep -q '^FAIL' <<< "$sout"; then ok "$t"; else fail "$t" "rc=$rc $sout"; fi
 
-# --- dictation-smoke flow with stubs ----------------------------------------
-# Stub hs, say and osascript on PATH; every call is appended to $SM/calls.
-# Nothing here reaches the real Hammerspoon, mic, speakers, TextEdit or clipboard.
-smoke_bin="$work/smoke-bin"
-mkdir -p "$smoke_bin"
-cat > "$smoke_bin/hs" <<'SH'
+
+# --- guided dictation smoke with stubs ------------------------------------------------
+# A STATEFUL hs stub simulates Ben dictating. Every log poll prints the current log (last 40)
+# and then appends the next scenario step ($GS/steps/<n>, one file per poll), so the log grows
+# over successive polls. "!lastrec <path>" sets _G.lastRecording and touches the file (it was just
+# archived); "!lastrec_stale <path>" sets it without touching. "!lastrec_down" makes the next
+# _G.lastRecording read fail once; "!down" makes every later call fail. The stub uses shell builtins
+# where it can: process spawns, not sleeps, dominate the suite's run time. Every hs and
+# osascript call is logged. Forbidden binaries on PATH record any use. Fake HOME throughout:
+# nothing here reaches the real Hammerspoon, mic, speakers, TextEdit or clipboard.
+g_bin="$work/guided-bin"; g_forbid="$work/guided-forbid"; g_forbid_log="$work/forbidden-calls"
+mkdir -p "$g_bin" "$g_forbid"
+: > "$g_forbid_log"
+for b in hs osascript say afplay; do
+  printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\nexit 99\n' "$b" "$g_forbid_log" > "$g_forbid/$b"
+done
+cat > "$g_bin/hs" <<'SH'
 #!/usr/bin/env bash
-d="${SMOKE_STUB_DIR:?}"
+d="${GUIDED_STUB_DIR:?}"
+[ "${1:-}" = "-c" ] || { echo "stub hs: expected -c" >&2; exit 64; }
+printf '%s\n' "${2//$'\n'/\\n}" >> "$d/hs_calls"
+[ -f "$d/down" ] && { echo "error: can't access Hammerspoon message port" >&2; exit 69; }
 case "$2" in
-  'return type(_G.startRecording)') echo function ;;
-  *'_G.dictationLog'*) cat "$d/dictlog" 2>/dev/null || true ;;
-  '_G.startRecording()')
-    echo start >> "$d/calls"
-    n=$(grep -c . "$d/calls")
-    echo "10:00:$n mic READY - audio is now flowing" >> "$d/dictlog" ;;
-  '_G.stopRecordingAndTranscribe()')
-    echo stop >> "$d/calls"
-    n=$(grep -c '^stop$' "$d/calls")
-    printf '10:01:%s TEXT (1.%s0s from release to paste): %s\n' "$n" "$n" \
-      "$(sed -n "${n}p" "$d/sentences")" >> "$d/dictlog" ;;
+  *'#_G.dictationLog'*)
+    [ -f "$d/hang" ] && exec sleep 30
+    tail -n 40 "$d/dictlog"
+    read -r n < "$d/step"; echo $((n + 1)) > "$d/step"
+    [ -f "$d/steps/$n" ] || exit 0
+    read -r c < "$d/count"
+    while IFS= read -r line; do
+      case "$line" in
+        '!lastrec '*) printf '%s\n' "${line#!lastrec }" > "$d/lastrec"; touch "${line#!lastrec }" ;;
+        '!lastrec_stale '*) printf '%s\n' "${line#!lastrec_stale }" > "$d/lastrec" ;;
+        '!lastrec_down') : > "$d/lastrec_down" ;;
+        '!down') : > "$d/down" ;;
+        *) c=$((c + 1)); printf '10:%02d:%02d %s\n' $((c / 60)) $((c % 60)) "$line" >> "$d/dictlog" ;;
+      esac
+    done < "$d/steps/$n"
+    echo "$c" > "$d/count" ;;
+  *'type(_G.dictationLog)'*) read -r v < "$d/logtype"; echo "$v" ;;
+  *'isPrimedOrRecording'*) read -r v < "$d/busy"; echo "$v" ;;
+  *'_G.lastRecording'*)
+    if [ -f "$d/lastrec_down" ]; then rm -f "$d/lastrec_down"; exit 69; fi
+    read -r v < "$d/lastrec"; echo "$v" ;;
   *) echo "stub hs: unexpected command: $2" >&2; exit 65 ;;
 esac
 SH
-cat > "$smoke_bin/say" <<'SH'
+cat > "$g_bin/osascript" <<'SH'
 #!/usr/bin/env bash
-d="${SMOKE_STUB_DIR:?}"
-if [ "${2:-}" = "?" ]; then echo "Carmit              he_IL    # שלום"; exit 0; fi
-echo say >> "$d/calls"
-[ -f "$d/say_fail" ] && exit 1
-[ -f "$d/say_int" ] && kill -INT "$PPID"
+# Logs one line per call: the joined script, then DOC=<first argv item after the script>.
+d="${GUIDED_STUB_DIR:?}"; script=""; doc=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-e" ]; then script="$script | $2"; shift 2; else doc="$1"; shift; break; fi
+done
+printf 'SCRIPT%s\tDOC=%s\tTEXT=%s\n' "$script" "$doc" "${1//$'\n'/\\n}" >> "$d/osa_calls"
+case "$script" in *'make new document'*) echo "Untitled 7" ;; esac
 exit 0
 SH
-cat > "$smoke_bin/osascript" <<'SH'
+cat > "$g_bin/pgrep" <<'SH'
 #!/usr/bin/env bash
-echo "osascript $*" >> "${SMOKE_STUB_DIR:?}/calls"
+exit 1
 SH
-chmod +x "$smoke_bin"/*
+# cp that copies faithfully, then corrupts one byte of the copy (never the source).
+cat > "$g_bin/cp-corrupt" <<'SH'
+#!/usr/bin/env bash
+/bin/cp "$@" || exit $?
+dest="${@: -1}"
+f="$(find "$dest" -type f | sort | head -n 1)"
+printf 'X' >> "$f"
+SH
+chmod +x "$g_bin"/* "$g_forbid"/*
 
-# smoke_env <name>: sets SM (stub state) and SH_HOME (fake HOME with 2 recordings).
-smoke_env() {
-  SM="$work/$1/stub"; SH_HOME="$work/$1/home"; SBL="$work/$1/baseline dir"
-  mkdir -p "$SM" "$SH_HOME/.hammerspoon/recordings"
-  : > "$SM/calls"
-  touch "$SH_HOME/.hammerspoon/recordings/a.wav" "$SH_HOME/.hammerspoon/recordings/b.wav"
-  printf '%s\n' "הבאג בצ׳קאאוט תוקן לפני הדיפלוי לפרודקשן" \
-    "צריך לעשות מרג׳ לברנץ׳ ולהריץ את הטסטים" "שלחתי פול ריקווסט עם הריפקטור של הקומפוננטה" \
-    > "$SM/sentences"
+G1="הבאג בצ׳קאאוט תוקן לפני הדיפלוי לפרודקשן"
+G2="צריך לעשות מרג׳ לברנץ׳ ולהריץ את הטסטים"
+G3="שלחתי פול ריקווסט עם הריפקטור של הקומפוננטה"
+G_START="start() - combo completed, isRecording=true"
+
+# g_wavs <dir>: tone (-20 dBFS), silent and mostly silent (short burst) 16-bit WAVs.
+g_wavs() {
+  python3 -I - "$1" <<'PY'
+import math, os, sys, wave
+from array import array
+def write(name, samples):
+    with wave.open(os.path.join(sys.argv[1], name), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes(array("h", samples).tobytes())
+def tone(sec):
+    amp = 32768 * 0.1 * math.sqrt(2)
+    return [int(amp * math.sin(2 * math.pi * 1000 * i / 16000)) for i in range(int(sec * 16000))]
+write("tone.wav", tone(3))
+write("silent.wav", [0] * 48000)
+write("burst.wav", [0] * 160000 + tone(0.5))
+write("trunc.wav", tone(3))  # the header claims 3 s; cut to half
+p = os.path.join(sys.argv[1], "trunc.wav")
+os.truncate(p, os.path.getsize(p) // 2)
+PY
 }
-run_smoke() {
-  set +e
-  SOUT="$(HOME="$SH_HOME" PATH="$smoke_bin:$PATH" HS_BIN="$smoke_bin/hs" SMOKE_STUB_DIR="$SM" \
-    BASELINE_DIR="$SBL" bash "$here/dictation-smoke.sh" "$@" 2>&1)"
-  SRC=$?
-  set -e
+g_wavs_dir="$work/guided-wavs"; mkdir -p "$g_wavs_dir"; g_wavs "$g_wavs_dir"
+
+# g_env <name>: fake HOME with 3 recordings, fresh stub state. Sets GS, GH, GBL.
+g_env() {
+  GS="$work/$1/stub"; GH="$work/$1/home"; GBL="$work/$1/baseline dir"
+  mkdir -p "$GS/wavs" "$GS/steps" "$GH/.hammerspoon/recordings"
+  : > "$GS/dictlog"; : > "$GS/hs_calls"; : > "$GS/osa_calls"
+  echo 0 > "$GS/step"; echo 0 > "$GS/count"; G_STEPS=0; echo table > "$GS/logtype"; echo "false false" > "$GS/busy"; echo nil > "$GS/lastrec"
+  local i
+  for i in 1 2 3; do printf 'personal recording %s' "$i" > "$GH/.hammerspoon/recordings/2026102$i-100000.wav"; done
+  G_CP=cp; G_HS_TIMEOUT=2; G_ATTEMPT_TIMEOUT=""; G_N=0
 }
-count_calls() { grep -c "^$1\$" "$SM/calls" || true; }
+g_reset_stub() { : > "$GS/dictlog"; echo 0 > "$GS/step"; echo 0 > "$GS/count"; echo nil > "$GS/lastrec"; }
+g_rec_sha() { (cd "$GH/.hammerspoon/recordings" && find . -type f | LC_ALL=C sort | xargs shasum -a 256); }
+g_cmd() {
+  printf '%s\0' env HOME="$GH" PATH="$g_forbid:$PATH" HS_BIN="$g_bin/hs" OSASCRIPT_BIN="$g_bin/osascript" \
+    PGREP_BIN="$g_bin/pgrep" CP_BIN="$G_CP" GUIDED_STUB_DIR="$GS" BASELINE_DIR="$GBL" \
+    SMOKE_HS_TIMEOUT_S="$G_HS_TIMEOUT" SMOKE_POLL_INTERVAL_S=0.05 SMOKE_LEVEL_WAIT_S=0.5 \
+    SMOKE_ATTEMPT_TIMEOUT_S="$G_ATTEMPT_TIMEOUT" bash "$here/dictation-smoke.sh" "$@"
+}
+# g_run <args...>: sets GOUT and GRC.
+g_run() {
+  local cmd=()
+  while IFS= read -r -d '' a; do cmd+=("$a"); done < <(g_cmd "$@")
+  set +e; GOUT="$("${cmd[@]}" 2>&1)"; GRC=$?; set -e
+}
 
-t=smoke_stub_save_and_compare_baseline
-smoke_env "$t"
-run_smoke --save-baseline
-saved="$(tail -n 1 <<< "$SOUT")"
-if [ $SRC -eq 0 ] && [ -f "$saved" ] && [ "$(count_calls start)" = 3 ] && [ "$(count_calls stop)" = 3 ] \
-   && python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert all(s["cer"]==0 for s in r["sentences"]); assert r["median_latency_s"]==1.2' "$saved" \
-   && [ "$(find "$SBL"/recordings-backup-* -type f | wc -l | tr -d ' ')" = 2 ]; then
-  : > "$SM/calls"; : > "$SM/dictlog"  # fresh stub state for the second run
-  run_smoke --baseline "$saved"
-  if [ $SRC -eq 0 ] && ls "$SBL"/compare-*/results.json >/dev/null 2>&1 \
-     && grep -q 'RESULT: PASS' "$SBL"/compare-*/decision.txt; then ok "$t"; else fail "$t" "compare rc=$SRC $SOUT"; fi
-else
-  fail "$t" "save rc=$SRC $SOUT"
-fi
+# Scenario builders: one attempt each, ending with an empty step so the poll that sees the
+# outcome does not consume the next attempt's first step.
+g_step() {  # g_step [line...]: the next poll's log lines (none = a quiet poll)
+  if [ $# -gt 0 ]; then printf '%s\n' "$@" > "$GS/steps/$G_STEPS"; else : > "$GS/steps/$G_STEPS"; fi
+  G_STEPS=$((G_STEPS + 1))
+}
+g_dict() {  # g_dict <text> [wav=tone] [audio_s=6.10] [latency=0.70]
+  G_N=$((G_N + 1))
+  local wav="$GS/wavs/a$G_N.wav"
+  cp "$g_wavs_dir/${2:-tone}.wav" "$wav"
+  g_step "priming: opening mic on first modifier key" "$G_START" "mic READY - audio is now flowing"
+  g_step "stop() heldFor=${3:-6.10}" "recorder exited code=0" "sending ${3:-6.10}s of audio (195244 bytes)" "!lastrec $wav"
+  g_step "curl exited code=0" "TEXT (${4:-0.70}s from release to paste): $1"
+  g_step
+}
+g_short() { g_step "$G_START"; g_step "stop() heldFor=0.20" "held only 0.20s, ignoring"; g_step; }
+g_fail() {  # g_fail <lines after the upload...>
+  g_step "$G_START"; g_step "stop() heldFor=5.00" "sending 5.00s of audio (160044 bytes)"; g_step "$@"; g_step
+}
+# g_json <results.json> <python assertion expr over r>
+g_json() { python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if eval(sys.argv[2]) else 1)' "$1" "$2"; }
+g_one() { ls "$GBL"/$1/results.json 2>/dev/null | head -n 1 || true; }
+g_stat() { printf 'rc=%s\n%s\n' "$GRC" "$GOUT" | tail -n 40; }
 
-t=smoke_failing_say_still_stops_recording
-smoke_env "$t"; touch "$SM/say_fail"
-run_smoke
-if [ $SRC -ne 0 ] && [ "$(count_calls start)" = 1 ] && [ "$(count_calls stop)" = 1 ] \
-   && [ "$(tail -n 2 "$SM/calls" | head -n 1)" = "osascript -e tell application \"TextEdit\" to activate" ] \
-   && [ "$(tail -n 1 "$SM/calls")" = stop ]; then ok "$t"; else fail "$t" "rc=$SRC calls=$(tr '\n' '|' < "$SM/calls") $SOUT"; fi
+t=guided_valid_run_saves_baseline
+g_env "$t"; g_dict "$G1"; g_dict "$G2" tone 6.10 0.80; g_dict "$G3" tone 6.10 0.60
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+res="$(ls "$GBL"/2*/results.json 2>/dev/null | head -n 1)"
+if [ $GRC -eq 0 ] && [ -n "$res" ] && grep -q 'saved baseline:' <<< "$GOUT" \
+   && g_json "$res" 'r["valid"] and r["attempts_used"]==3 and r["summary"]["median_latency_s"]==0.7 and all(s["status"]=="valid" and s["cer"]==0 and abs(s["mean_db"]+20)<0.2 and s["active_ratio"]==1.0 for s in r["sentences"]) and r["recordings"]["before"]==3' \
+   && [ "$(find "$GBL"/recordings-backup-* -type f | wc -l | tr -d ' ')" = 3 ] \
+   && grep -q 'up to 3 of the oldest will rotate out' <<< "$GOUT" \
+   && grep -q '== Dictation state at the end' <<< "$GOUT"; then
+  g_reset_stub
+  g_run --accept-rotation 3 --baseline "$res" --attempt-timeout 10
+  if [ $GRC -eq 0 ] && grep -q 'RESULT: PASS' "$GBL"/compare-*/decision.txt; then
+    printf '{"valid": true, "summary": {"median_latency_s": 0.3}}' > "$work/$t/fast-baseline.json"
+    g_reset_stub; rm -rf "$GBL"/compare-*
+    g_run --accept-rotation 3 --baseline "$work/$t/fast-baseline.json" --attempt-timeout 10
+    if [ $GRC -eq 1 ] && grep -q 'FAIL median latency' "$GBL"/compare-*/decision.txt; then ok "$t"
+    else fail "$t" "latency regression not caught: $(g_stat)"; fi
+  else fail "$t" "compare: $(g_stat)"; fi
+else fail "$t" "save: $(g_stat)"; fi
 
-t=smoke_interrupt_still_stops_recording
-smoke_env "$t"; touch "$SM/say_int"
-run_smoke
-if [ $SRC -eq 130 ] && [ "$(count_calls start)" = 1 ] && [ "$(count_calls stop)" = 1 ] \
-   && [ "$(tail -n 1 "$SM/calls")" = stop ]; then ok "$t"; else fail "$t" "rc=$SRC calls=$(tr '\n' '|' < "$SM/calls") $SOUT"; fi
+t=guided_silent_attempt_retried_then_valid
+g_env "$t"; g_dict "$G1" burst; g_dict "$G1"; g_dict "$G2"; g_dict "$G3"
+g_run --accept-rotation 4 --save-baseline --attempt-timeout 10
+res="$(ls "$GBL"/2*/results.json 2>/dev/null | head -n 1)"
+if [ $GRC -eq 0 ] && [ -n "$res" ] \
+   && g_json "$res" 'r["valid"] and [a["status"] for a in r["sentences"][0]["attempts"]]==["invalid_silent","valid"] and r["sentences"][0]["attempts"][0]["active_ratio"]<0.15' \
+   && grep -q 'Previous attempt was too quiet — please try again, closer to the mic' "$GS/osa_calls"; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
 
-t=smoke_backup_failure_aborts_before_dictation
-smoke_env "$t"; mkdir -p "$SBL"; chmod 500 "$SBL"
-run_smoke
-chmod 700 "$SBL"
-if [ $SRC -eq 3 ] && [ "$(count_calls start)" = 0 ]; then ok "$t"; else fail "$t" "rc=$SRC $SOUT"; fi
+t=guided_hallucination_low_level_is_invalid_not_accuracy_fail
+g_env "$t"; g_dict "תודה" silent; g_dict "$G1"; g_dict "$G2"; g_dict "$G3"
+g_run --accept-rotation 4 --save-baseline --attempt-timeout 10
+res="$(ls "$GBL"/2*/results.json 2>/dev/null | head -n 1)"
+if [ $GRC -eq 0 ] && [ -n "$res" ] \
+   && g_json "$res" 'r["sentences"][0]["attempts"][0]["status"]=="invalid_silent" and r["sentences"][0]["attempts"][0]["mean_db"]<=-100 and r["summary"]["accuracy_failures"]==[] and r["sentences"][0]["status"]=="valid"'; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_accuracy_fail_is_valid_and_reported
+g_env "$t"; g_dict "$G1"; g_dict "משהו אחר לגמרי שלא נאמר בכלל"; g_dict "$G3"
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+res="$(ls "$GBL"/2*/results.json 2>/dev/null | head -n 1)"
+if [ $GRC -eq 0 ] && [ -n "$res" ] \
+   && g_json "$res" 'r["valid"] and r["attempts_used"]==3 and r["sentences"][1]["status"]=="accuracy_fail" and len(r["sentences"][1]["attempts"])==1 and r["summary"]["accuracy_failures"]==[2] and r["summary"]["invalid"]==[] and r["summary"]["max_cer"]>0.15' \
+   && grep -q 'failures (CER > 0.15): \[2\]' <<< "$GOUT"; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_short_hold_invalid_short
+g_env "$t"; g_short; g_dict "$G1" tone 1.00; g_dict "$G1"; g_dict "$G2"; g_dict "$G3"
+g_run --accept-rotation 5 --save-baseline --attempt-timeout 10
+res="$(ls "$GBL"/2*/results.json 2>/dev/null | head -n 1)"
+if [ $GRC -eq 0 ] && [ -n "$res" ] \
+   && g_json "$res" '[a["status"] for a in r["sentences"][0]["attempts"]]==["invalid_short","invalid_short","valid"]' \
+   && grep -q 'Previous attempt was too short' "$GS/osa_calls"; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_timeout_no_dictation
+g_env "$t"; G_ATTEMPT_TIMEOUT=0.5
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 1
+res="$(g_one 'invalid-*')"
+if [ $GRC -eq 1 ] && [ -n "$res" ] && ! ls -d "$GBL"/2* >/dev/null 2>&1 \
+   && g_json "$res" 'not r["valid"] and [a["status"] for a in r["sentences"][0]["attempts"]]==["no_dictation_timeout"]*3 and [s["status"] for s in r["sentences"][1:]]==["not_run","not_run"]' \
+   && grep -q 'No dictation was detected' "$GS/osa_calls"; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_groq_error_classified
+g_env "$t"
+g_fail "curl exited code=6" "curl stderr:\\ncould not resolve host"; g_dict "$G1"
+g_fail "curl exited code=0" 'Groq auth error: {"error":{"code":"invalid_api_key"}}'; g_dict "$G2"
+g_fail "ERROR: no Groq API key at /fake/key"; g_fail "could not parse response: <html>"
+g_run --accept-rotation 6 --save-baseline --attempt-timeout 10
+res="$(g_one 'invalid-*')"
+if [ $GRC -eq 1 ] && [ -n "$res" ] \
+   && g_json "$res" '[[a["status"] for a in s["attempts"]] for s in r["sentences"]]==[["error_transcription_service","valid"],["error_transcription_service","valid"],["error_transcription_service","error_transcription_service"]] and r["sentences"][2]["status"]=="error_transcription_service" and r["attempts_used"]==6' \
+   && grep -q 'NOT saved as baseline: sentence 3: error_transcription_service' <<< "$GOUT"; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_rotation_budget_stops_and_not_saved
+g_env "$t"; g_dict "$G1" silent; g_dict "$G1" silent; g_dict "$G1"; g_dict "$G2"; g_dict "$G3"
+g_run --accept-rotation 2 --save-baseline --attempt-timeout 10
+res="$(g_one 'invalid-*')"
+if [ $GRC -eq 1 ] && [ -n "$res" ] && ! ls -d "$GBL"/2* >/dev/null 2>&1 \
+   && g_json "$res" 'r["attempts_used"]==2 and not r["valid"] and [s["status"] for s in r["sentences"]]==["invalid_silent","not_run","not_run"]' \
+   && grep -q 'NOT saved as baseline: rotation budget used up (2 of 2 dictations)' <<< "$GOUT" \
+   && [ "$(grep -c 'from release to paste' "$GS/dictlog")" = 2 ]; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_stale_pointer_after_hs_failure_not_measured
+# Attempt 2: the pre-attempt read of _G.lastRecording fails and the pointer never moves off
+# attempt 1's WAV. Attempt 3: the pointer moves to a WAV written long before the attempt.
+g_env "$t"; g_dict "$G1"
+g_step "!lastrec_down" "priming: opening mic on first modifier key" "$G_START"
+g_step "stop() heldFor=6.10" "sending 6.10s of audio (195244 bytes)"
+g_step "curl exited code=0" "TEXT (0.70s from release to paste): $G2"; g_step
+old="$GS/wavs/old.wav"; cp "$g_wavs_dir/tone.wav" "$old"; touch -t 202001010000 "$old"
+g_step "$G_START"; g_step "stop() heldFor=6.10" "sending 6.10s of audio (195244 bytes)" "!lastrec_stale $old"
+g_step "curl exited code=0" "TEXT (0.70s from release to paste): $G3"; g_step
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+res="$(ls "$GBL"/2*/results.json 2>/dev/null | head -n 1)"
+if [ $GRC -eq 0 ] && [ -n "$res" ] \
+   && g_json "$res" 'r["valid"] and r["sentences"][0]["flags"]==[] and abs(r["sentences"][0]["mean_db"]+20)<0.2 and all(s["status"]=="valid" and s["flags"]==["level_unknown"] and s["mean_db"] is None for s in r["sentences"][1:]) and "pre-attempt pointer unknown" in r["sentences"][1]["reason"] and "older than this attempt" in r["sentences"][2]["reason"]'; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_truncated_wav_level_unknown
+g_env "$t"; g_dict "$G1" trunc; g_dict "$G2"; g_dict "$G3"
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+res="$(ls "$GBL"/2*/results.json 2>/dev/null | head -n 1)"
+if [ $GRC -eq 0 ] && [ -n "$res" ] \
+   && g_json "$res" 'r["valid"] and r["sentences"][0]["flags"]==["level_unknown"] and r["sentences"][0]["mean_db"] is None and r["sentences"][0]["reason"].endswith("truncated wav") and r["sentences"][1]["flags"]==[]'; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_stray_dictations_count_against_rotation
+# One unprompted dictation in the same poll as attempt 1's result, another before attempt 2:
+# with N=3 the budget is used up, so sentence 2 is never prompted.
+g_env "$t"; cp "$g_wavs_dir/tone.wav" "$GS/wavs/a1.wav"
+g_step "$G_START"; g_step "stop() heldFor=6.10" "sending 6.10s of audio (195244 bytes)" "!lastrec $GS/wavs/a1.wav"
+g_step "curl exited code=0" "TEXT (0.70s from release to paste): $G1" \
+       "$G_START" "stop() heldFor=3.00" "sending 3.00s of audio (96044 bytes)" "curl exited code=0" "TEXT (0.60s from release to paste): stray"
+g_step "$G_START" "stop() heldFor=2.00" "sending 2.00s of audio (64044 bytes)" "curl exited code=0" "TEXT (0.60s from release to paste): stray 2"
+g_dict "$G2"; g_dict "$G3"
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+res="$(g_one 'invalid-*')"
+if [ $GRC -eq 1 ] && [ -n "$res" ] && ! ls -d "$GBL"/2* >/dev/null 2>&1 \
+   && g_json "$res" 'r["attempts_used"]==1 and r["rotation_used"]==3 and r["unprompted_dictations"]==2 and not r["valid"] and [s["status"] for s in r["sentences"]]==["valid","not_run","not_run"]' \
+   && grep -q 'rotation budget used up (3 of 3 dictations)' <<< "$GOUT" \
+   && grep -q 'dictations counted against the rotation budget: 3 of 3 (2 unprompted)' <<< "$GOUT" \
+   && ! grep -q 'Sentence 2 of 3' "$GS/osa_calls"; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_compare_rejects_invalid_baseline
+g_env "$t"; g_dict "$G1"
+printf '{"valid": false, "summary": {"median_latency_s": 0.7}}' > "$work/$t/invalid.json"
+g_run --accept-rotation 3 --baseline "$work/$t/invalid.json" --attempt-timeout 10
+if [ $GRC -eq 2 ] && grep -q 'not a valid run' <<< "$GOUT" && [ -z "$(ls -A "$GBL" 2>/dev/null)" ] \
+   && [ ! -s "$GS/hs_calls" ] && [ ! -s "$GS/osa_calls" ]; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_compare_rejects_malformed_baseline
+g_env "$t"; g_dict "$G1"
+printf '{"valid": true, "summary": ' > "$work/$t/truncated.json"
+printf '{"valid": true, "summary": {"median_latency_s": "fast"}}' > "$work/$t/string.json"
+ok_all=1
+for b in truncated string; do
+  g_run --accept-rotation 3 --baseline "$work/$t/$b.json" --attempt-timeout 10
+  if [ $GRC -ne 2 ] || ! grep -q '^precondition: --baseline' <<< "$GOUT" || grep -q Traceback <<< "$GOUT"; then ok_all=0; fi
+done
+if [ $ok_all -eq 1 ] && [ -z "$(ls -A "$GBL" 2>/dev/null)" ] && [ ! -s "$GS/hs_calls" ] && [ ! -s "$GS/osa_calls" ]; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_decide_reports_invalid_not_accuracy
+# Sentence 3 is too short three times; Hammerspoon then goes away, so the end state is unknown.
+g_env "$t"; g_dict "$G1"; g_dict "$G2"; g_short; g_short
+g_step "$G_START"; g_step "stop() heldFor=0.20" "held only 0.20s, ignoring"; g_step "!down"
+printf '{"valid": true, "summary": {"median_latency_s": 5.0}}' > "$work/$t/baseline.json"
+g_run --accept-rotation 5 --baseline "$work/$t/baseline.json" --attempt-timeout 10
+dec="$(cat "$GBL"/compare-*/decision.txt 2>/dev/null || true)"
+if [ $GRC -eq 1 ] && grep -qx 'FAIL sentence 3 invalid: invalid_short' <<< "$dec" && ! grep -q 'cer' <<< "$dec" \
+   && grep -qx 'RESULT: FAIL' <<< "$dec" \
+   && grep -q 'NOTE: dictation state unknown (Hammerspoon not reachable)' <<< "$GOUT" \
+   && ! grep -q 'dictation is not idle' <<< "$GOUT"; then ok "$t"
+else fail "$t" "$dec $(g_stat)"; fi
+
+t=guided_refuses_without_accept_rotation
+g_env "$t"; g_dict "$G1"
+ok_all=1
+for args in "--save-baseline" "--save-baseline --accept-rotation 0" "--save-baseline --accept-rotation 13" \
+            "--save-baseline --accept-rotation x" "--accept-rotation 3"; do
+  # shellcheck disable=SC2086
+  g_run $args
+  if [ $GRC -ne 2 ]; then ok_all=0; fi
+done
+if [ $ok_all -eq 1 ] && [ -z "$(ls -A "$GBL" 2>/dev/null)" ] && [ ! -s "$GS/hs_calls" ] && [ ! -s "$GS/osa_calls" ]; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_refuses_when_dictation_busy
+g_env "$t"; g_dict "$G1"; echo "false true" > "$GS/busy"
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+if [ $GRC -eq 2 ] && grep -q 'dictation is not idle' <<< "$GOUT" && [ -z "$(ls -A "$GBL" 2>/dev/null)" ] \
+   && ! grep -q '#_G.dictationLog' "$GS/hs_calls" && [ ! -s "$GS/osa_calls" ]; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_backup_checksum_mismatch_aborts
+g_env "$t"; g_dict "$G1"; G_CP="$g_bin/cp-corrupt"; before="$(g_rec_sha)"
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+if [ $GRC -eq 3 ] && grep -q 'checksum mismatch' <<< "$GOUT" && ! grep -q '#_G.dictationLog' "$GS/hs_calls" \
+   && [ ! -s "$GS/osa_calls" ] && [ "$(g_rec_sha)" = "$before" ]; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_backup_copy_failure_aborts
+g_env "$t"; g_dict "$G1"; mkdir -p "$GBL"; chmod 500 "$GBL"
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+chmod 700 "$GBL"
+if [ $GRC -eq 3 ] && ! grep -q '#_G.dictationLog' "$GS/hs_calls" && [ ! -s "$GS/osa_calls" ]; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_hs_timeout_handled
+g_env "$t"; g_dict "$G1"; touch "$GS/hang"; G_HS_TIMEOUT=0.5
+start_s=$(date +%s)
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+elapsed=$(( $(date +%s) - start_s ))
+res="$(g_one 'invalid-*')"
+if [ $GRC -eq 1 ] && [ $elapsed -lt 10 ] && [ -n "$res" ] \
+   && g_json "$res" '[a["status"] for a in r["sentences"][0]["attempts"]]==["error_hs_timeout"]*2 and [s["status"] for s in r["sentences"][1:]]==["not_run","not_run"]' \
+   && grep -q 'Hammerspoon did not respond; stopped' <<< "$GOUT"; then ok "$t"
+else fail "$t" "elapsed=${elapsed}s $(g_stat)"; fi
+
+t=guided_never_calls_dictation_functions
+g_env "$t"; g_short; g_dict "$G1"; g_dict "$G2" silent; g_dict "$G2"; g_dict "$G3"
+g_run --accept-rotation 5 --save-baseline --attempt-timeout 10
+if [ $GRC -eq 0 ] && [ -s "$GS/hs_calls" ] \
+   && ! grep -qE 'startRecording|stopRecording|Priming|eventtap|dictationTap|releasedAt|=' <(sed 's/[a-z]=#_G\.dictationLog//; s/i=math\.max//; s/local p, r = //' "$GS/hs_calls") \
+   && [ "$(sort -u "$GS/hs_calls" | wc -l | tr -d ' ')" = 4 ]; then ok "$t"
+else fail "$t" "calls: $(sort -u "$GS/hs_calls") $(g_stat)"; fi
+
+t=guided_never_modifies_recordings
+g_env "$t"; g_dict "$G1"; g_dict "$G2"; g_dict "$G3"; before="$(g_rec_sha)"
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+bk="$(ls -d "$GBL"/recordings-backup-* | head -n 1)"
+if [ $GRC -eq 0 ] && [ "$(g_rec_sha)" = "$before" ] \
+   && [ "$(cd "$bk" && find . -type f | LC_ALL=C sort | xargs shasum -a 256)" = "$before" ]; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_only_new_textedit_document_touched
+g_env "$t"; g_dict "$G1" silent; g_dict "$G1"; g_dict "$G2"; g_dict "$G3"
+g_run --accept-rotation 4 --save-baseline --attempt-timeout 10
+others="$(grep -v 'make new document' "$GS/osa_calls" || true)"
+# AppleScript code only: the SCRIPT field with quoted strings removed.
+code="$(cut -f1 "$GS/osa_calls" | sed 's/"[^"]*"//g')"
+if [ $GRC -eq 0 ] && [ "$(grep -c 'make new document' "$GS/osa_calls")" = 1 ] \
+   && [ "$(wc -l <<< "$others" | tr -d ' ')" = 5 ] \
+   && ! grep -qv $'\tDOC=Untitled 7\t' <<< "$others" \
+   && [ "$(grep -v 'make new document' <<< "$code" | grep -oE 'documents?( [^ |)]+)?' | sort -u)" = "document docName" ] \
+   && ! grep -qiE 'close|save|delete|quit|front|window 1|every' <<< "$code" \
+   && grep -q 'TEXT=Sentence 1 of 3 — click here, then hold fn+Shift, read the sentence below, release:' "$GS/osa_calls" \
+   && grep -q 'TEXT=Smoke test finished: 3 of 3 sentences valid' "$GS/osa_calls"; then ok "$t"
+else fail "$t" "$(cat "$GS/osa_calls") $(g_stat)"; fi
+
+t=guided_interrupt_writes_partial_invalid
+g_env "$t"; g_dict "$G1"
+cmd=(); while IFS= read -r -d '' a; do cmd+=("$a"); done < <(g_cmd --accept-rotation 3 --save-baseline --attempt-timeout 30)
+"${cmd[@]}" > "$work/$t/out" 2>&1 &
+pid=$!
+for _ in $(seq 1 600); do grep -q 'Sentence 2 of 3' "$GS/osa_calls" 2>/dev/null && break; sleep 0.1; done
+sleep 0.3
+kill -TERM "$pid" 2>/dev/null || true
+set +e; wait "$pid"; GRC=$?; set -e
+GOUT="$(cat "$work/$t/out")"
+res="$(g_one 'invalid-*')"
+if [ $GRC -eq 143 ] && [ -n "$res" ] && ! ls -d "$GBL"/2* >/dev/null 2>&1 \
+   && g_json "$res" 'r["interrupted"] and not r["valid"] and r["sentences"][0]["status"]=="valid" and r["sentences"][1]["status"]=="not_run" and "interrupted" in r["invalid_reasons"]' \
+   && grep -q '== Dictation state at the end' <<< "$GOUT" \
+   && grep -q 'TEXT=Smoke test interrupted' "$GS/osa_calls"; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_no_forbidden_binaries_used
+if [ ! -s "$g_forbid_log" ]; then ok "$t"; else fail "$t" "$(cat "$g_forbid_log")"; fi
 
 echo "selftest: $pass ok, $failed failed"
 [ "$failed" -eq 0 ]
