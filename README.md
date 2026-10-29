@@ -54,7 +54,7 @@ record Zoom and Google Meet calls on the Mac as two tracks (your mic and the oth
 transcribe them in a free-tier Cloudflare Worker, extract a summary, decisions and action items
 that must each cite transcript evidence, and show them in a web dashboard.
 
-**The notetaker is not usable yet.** No notetaker code exists in this repository today. Status of
+**The notetaker is not usable yet.** No notetaker feature code exists yet; only its safety tooling (regression guards for dictation) has landed. Status of
 the [implementation plan](docs/superpowers/plans/2026-10-29-meeting-notetaker.md):
 
 | Stage | Scope | Status |
@@ -257,23 +257,34 @@ without the vocabulary prompt, `whisper-large-v3-turbo`, and ElevenLabs Scribe i
 │   ├── engineering-decisions.md
 │   ├── he/README.md              original Hebrew user guide
 │   └── superpowers/              notetaker design spec and implementation plan
-├── notetaker/                    (planned, does not exist yet)
-│   ├── mac/                      Hammerspoon module + meeting-recorder
-│   ├── worker/                   Cloudflare Worker + dashboard
-│   ├── eval/                     language/model evaluation
-│   └── tests/                    guards and test runners
+├── notetaker/
+│   ├── tests/                    implemented: dictation regression guards + test runner
+│   ├── mac/                      planned: Hammerspoon module + meeting-recorder
+│   ├── worker/                   planned: Cloudflare Worker + dashboard
+│   └── eval/                     planned: language/model evaluation
 ├── LICENSE
 └── README.md
 ```
 
 ## Testing and quality
 
-- **Today:** there is no automated test suite. Quality is checked with manual measurement:
-  release-to-paste timing in the dictation log, the recorder's `DICTATION_TIMING` breakdown, and
-  `compare-transcribers.sh` for side-by-side engine comparisons on real recordings.
-- **In progress:** baseline regression guards for dictation (plan Task 0.1): snapshot and verify
-  scripts for protected files, hotkeys and globals, a repo no-touch check, an isolation lint and a
-  dictation smoke test.
+- **Dictation quality** is measured manually: release-to-paste timing in the dictation log, the
+  recorder's `DICTATION_TIMING` breakdown, and `compare-transcribers.sh` for side-by-side engine
+  comparisons on real recordings.
+- **Regression guards (implemented, plan Task 0.1).** `notetaker/tests/` protects the working
+  dictation product before any notetaker code lands:
+  - `snapshot.sh` / `verify.sh`: hash-only snapshot of the live config, recorder and key files,
+    plus hotkeys and dictation globals. The only change verify accepts is the single planned
+    integration line.
+  - `repo-no-touch.sh`: fails any branch that edits a dictation source file.
+  - `isolation-lint.sh`: rejects notetaker code that touches dictation globals, hotkeys, event
+    taps, recordings or credentials.
+  - `dictation-smoke.sh`: a live end-to-end check (character error rate and latency against a
+    stored baseline). It backs up recordings first, and always stops recording on failure.
+  - `run-all.sh`: runs the offline self-test suite (58 cases), with fake home directories and a
+    stubbed Hammerspoon CLI.
+
+  Each task is built by one agent and independently verified by another before merging.
 - **Planned:** Vitest suites for the Worker (local D1/KV, mocked Groq), plain Lua unit tests for the
   notetaker's pure logic, scripted recorder tests, and a separate builder and verifier review for
   every task.
