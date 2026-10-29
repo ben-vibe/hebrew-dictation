@@ -135,7 +135,7 @@ saved text after 1 s.
 ("the clipboard is restored after one second").
 
 **Consequences.** Dictation does not destroy the user's clipboard. The restore covers text
-contents; the 1 s delay leaves the target app time to read the clipboard.
+contents.
 
 ---
 

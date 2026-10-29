@@ -135,7 +135,7 @@ Each decision is written up with its context and consequences in
 - **Flags off by default.** `enabled`, `autoRecord`, `upload` and `echoCancel` all start off;
   paid processing in the Worker starts disabled.
 - **Baseline regression guards.** Snapshots of protected files, hotkeys and globals, plus a
-  dictation smoke test, are checked after every install.
+  dictation smoke test, will be checked after every install.
 - **Staged rollout with human approval gates.** Every deploy, install and merge to `main` needs
   explicit approval, and rollback is as light as deleting that one line.
 
@@ -163,11 +163,16 @@ cd hebrew-dictation
 ./install.sh
 ```
 
-The installer checks prerequisites, builds the recorder into `~/.hammerspoon/bin/`, installs
-`dictation.lua` into `~/.hammerspoon/`, and loads it from `init.lua`. If an `init.lua` already
-exists, it is backed up before the `require` line is appended.
+The installer, in order:
 
-It then asks for your Groq key and stores it at `~/.config/dictation-groq-key` with mode `600`.
+1. Checks prerequisites and builds the recorder into `~/.hammerspoon/bin/`.
+2. Asks for your Groq key and stores it at `~/.config/dictation-groq-key` with mode `600`. If a
+   key is already saved there, it is left alone and the question is skipped.
+3. Installs `dictation.lua` into `~/.hammerspoon/` and loads it from `init.lua`:
+   - no `init.lua` yet → one is created with `require("dictation")`;
+   - an `init.lua` that already mentions dictation → left untouched, with no backup;
+   - any other `init.lua` → backed up with a timestamp, then `require("dictation")` is appended.
+
 The key is never written into the code. **Never commit it;** `.gitignore` excludes the key file
 names as a safeguard.
 

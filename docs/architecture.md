@@ -20,8 +20,8 @@ Three components, all in this repository:
 | Engine comparison | [`bin/compare-transcribers.sh`](../bin/compare-transcribers.sh) | Replays a saved recording through several engines for side-by-side comparison |
 
 [`install.sh`](../install.sh) builds the recorder with `swiftc -O` into `~/.hammerspoon/bin/`,
-copies `dictation.lua` into `~/.hammerspoon/`, stores the Groq key, and adds `require("dictation")`
-to `init.lua`.
+stores the Groq key (unless one is already saved), copies `dictation.lua` into `~/.hammerspoon/`,
+and adds `require("dictation")` to `init.lua` unless it already mentions dictation.
 
 ### Flow
 
@@ -140,8 +140,8 @@ flowchart LR
   clock: `self` (mic via AVAudioEngine) and `others` (a Core Audio process tap on the meeting app).
   It writes AAC `.m4a` chunks of about 5 minutes, cut at the quietest point within ±15 s, to a
   local spool.
-- **`notetaker.lua`**: a Hammerspoon controller that detects meetings (Meet/Zoom tab URL or Zoom
-  desktop, plus mic in use), shows a cancellable 10-second countdown and a menubar indicator, and
+- **`notetaker.lua`**: a Hammerspoon controller that detects meetings (a Meet or Zoom-web tab
+  with the mic in use, or the Zoom desktop meeting process), shows a cancellable 10-second countdown and a menubar indicator, and
   runs an uploader that drains the spool with `hs.task` + `curl` and exponential backoff.
 - Local chunks are deleted only after the server reports them **transcribed**, not just uploaded.
 
@@ -211,7 +211,8 @@ loading. Appending the line is an approval step, done once.
 
 ### Isolation rules
 
-Each is enforced by an automated check (`isolation-lint.sh`, `repo-no-touch.sh`):
+Each will be enforced by an automated check (`isolation-lint.sh`, `repo-no-touch.sh`, added in
+plan Task 0.1):
 
 - Notetaker files live only under their own paths; settings use the `notetaker.` prefix.
 - The only global is `_G.notetaker`; no dictation global is read or written.
