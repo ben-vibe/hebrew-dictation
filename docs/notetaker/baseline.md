@@ -43,7 +43,17 @@ dictation.
 
 Neither run is kept as the reference: both are marked invalid.
 
-**Next:** make the smoke test independent of acoustics. One option is a guided mode where the
-owner reads the three sentences aloud using the real fn+Shift hotkey, which also covers the
-hotkey path. Also add a `say` duration check and slower log polling. These go through the usual
-builder/verifier review.
+**Resolved (2026-10-29): guided smoke test.** `dictation-smoke.sh` was rewritten so the owner reads
+the three sentences aloud using the real fn+Shift shortcut. The script only reads dictation's state and
+never calls a dictation function. It:
+- backs up every recording and verifies each one by SHA-256;
+- refuses to run without an explicit cap (`--accept-rotation N`) on how many dictations it may cause,
+  since each one rotates out the oldest personal recording;
+- uses hard timeouts on every Hammerspoon query;
+- checks each recording's length and level, so silent or truncated audio, or Whisper's silence
+  hallucinations, is classified as invalid instead of as a transcription error;
+- saves an official baseline only when all three sentences are valid.
+
+78 offline test cases cover it, and two independent review rounds passed it.
+
+The live guided run is pending, and needs the owner at the Mac.

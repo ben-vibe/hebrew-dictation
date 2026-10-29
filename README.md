@@ -279,9 +279,12 @@ without the vocabulary prompt, `whisper-large-v3-turbo`, and ElevenLabs Scribe i
   - `repo-no-touch.sh`: fails any branch that edits a dictation source file.
   - `isolation-lint.sh`: rejects notetaker code that touches dictation globals, hotkeys, event
     taps, recordings or credentials.
-  - `dictation-smoke.sh`: a live end-to-end check (character error rate and latency against a
-    stored baseline). It backs up recordings first, and always stops recording on failure.
-  - `run-all.sh`: runs the offline self-test suite (58 cases), with fake home directories and a
+  - `dictation-smoke.sh`: a guided live end-to-end check. The owner reads three sentences using the
+    real shortcut, and the script measures character error rate and latency against a stored baseline.
+    It is read-only toward dictation, caps how many recordings a run may rotate, checks audio level
+    and duration so silence is never mistaken for a transcription error, and saves a baseline only
+    from a valid run.
+  - `run-all.sh`: runs the offline self-test suite (78 cases), with fake home directories and a
     stubbed Hammerspoon CLI.
 
   Each task is built by one agent and independently verified by another before merging.
