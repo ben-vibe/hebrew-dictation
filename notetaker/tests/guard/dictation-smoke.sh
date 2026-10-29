@@ -170,12 +170,15 @@ def db(mean_square):
 
 def level(path):
     """(mean_db, active_ratio) of a 16-bit PCM WAV: RMS in dBFS over the whole file, and the
-    fraction of 50 ms windows above -45 dBFS. Raises on anything unreadable."""
+    fraction of 50 ms windows above -45 dBFS. Raises on anything unreadable, including a file
+    with fewer frames than its header claims: a partial measurement is not a measurement."""
     with wave.open(path, "rb") as w:
         if w.getsampwidth() != 2:
             raise ValueError(f"not 16-bit PCM (sample width {w.getsampwidth()})")
-        rate, ch = w.getframerate(), w.getnchannels()
-        frames = w.readframes(w.getnframes())
+        rate, ch, n = w.getframerate(), w.getnchannels(), w.getnframes()
+        frames = w.readframes(n)
+    if len(frames) < n * 2 * ch:
+        raise ValueError("truncated wav")
     samples = array("h")
     samples.frombytes(frames[:len(frames) // 2 * 2])
     if sys.byteorder == "big":
@@ -216,11 +219,20 @@ def evaluate(att, ref, lvl, lvl_error=""):
 
 def new_state(ts, mode, budget, refs):
     return {"ts": ts, "mode": mode, "accept_rotation": budget, "attempts_used": 0,
+            "rotation_used": 0, "sends_seen": 0,
             "stopped": "", "sentences": [{"ref": r, "attempts": []} for r in refs]}
+
+def observe(state, entries):
+    """Count every upload in new log entries seen while the run is active, prompted or not:
+    each one archives a recording, so each counts against the rotation budget."""
+    n = sum(1 for e in entries if SEND_RE.match(message(e)))
+    state["sends_seen"] += n
+    state["rotation_used"] += n
 
 def plan(state, k):
     """Next step for sentence k: ("run", retry message), ("next", "") or ("stop", "").
-    Every attempt counts against the rotation budget, retries included."""
+    Every attempt counts against the rotation budget, retries included, and so does every
+    unprompted dictation seen while the run is active."""
     if state["stopped"]:
         return ("stop", "")
     atts = state["sentences"][k - 1]["attempts"]
@@ -233,8 +245,8 @@ def plan(state, k):
                 state["stopped"] = "Hammerspoon did not respond; stopped"
                 return ("stop", "")
             return ("next", "")
-    if state["attempts_used"] >= state["accept_rotation"]:
-        state["stopped"] = f"rotation budget used up ({state['accept_rotation']} attempts)"
+    if state["rotation_used"] >= state["accept_rotation"]:
+        state["stopped"] = f"rotation budget used up ({state['rotation_used']} of {state['accept_rotation']} dictations)"
         return ("stop", "")
     return ("run", RETRY_MSG.get(atts[-1]["status"], "") if atts else "")
 
@@ -242,6 +254,8 @@ def record(state, k, att):
     att = dict(att)
     att.pop("stage", None)
     state["attempts_used"] += 1
+    if att.get("audio_s") is None:  # no upload was seen for it (observe counted those that were)
+        state["rotation_used"] += 1
     att["n"] = state["attempts_used"]
     state["sentences"][k - 1]["attempts"].append(att)
     return att
@@ -266,8 +280,10 @@ def build_results(state, interrupted=False, recordings=None):
     for k, r in enumerate(rows, 1):
         if r["status"] not in VALID:
             reasons.append(f"sentence {k}: {r['status']}" + (f" ({r['reason']})" if r["reason"] else ""))
+    sent = sum(1 for s in state["sentences"] for a in s["attempts"] if a.get("audio_s") is not None)
     return {"ts": state["ts"], "mode": state["mode"], "accept_rotation": state["accept_rotation"],
-            "attempts_used": state["attempts_used"],
+            "attempts_used": state["attempts_used"], "rotation_used": state["rotation_used"],
+            "unprompted_dictations": max(0, state["sends_seen"] - sent),
             "valid": not interrupted and all(r["status"] in VALID for r in rows),
             "interrupted": interrupted, "invalid_reasons": reasons, "sentences": rows,
             "summary": {"median_latency_s": statistics.median(lat) if lat else None,
@@ -280,13 +296,36 @@ def build_results(state, interrupted=False, recordings=None):
 def baseline_median(baseline):
     return (baseline.get("summary") or {}).get("median_latency_s", baseline.get("median_latency_s"))
 
+def baseline_problem(b):
+    """Why a --baseline file cannot be compared against, or "" when it can."""
+    if not isinstance(b, dict):
+        return "not a results object"
+    if b.get("valid") is not True:
+        return "not a valid run (\"valid\" is not true)"
+    m = b.get("summary").get("median_latency_s") if isinstance(b.get("summary"), dict) else None
+    if isinstance(m, bool) or not isinstance(m, (int, float)) or m != m:
+        return "summary.median_latency_s is not a number"
+    return ""
+
+def check_baseline(path):
+    try:
+        problem = baseline_problem(load(path))
+    except (OSError, ValueError) as ex:
+        problem = f"not readable JSON ({ex})"
+    if problem:
+        print(f"precondition: --baseline {path}: {problem}", file=sys.stderr)
+        return 2
+    return 0
+
 def decide(results, baseline):
     """Return (ok, reasons). PASS = valid, every cer <= 0.15, median latency within slack."""
     reasons = []
     if not results.get("valid"):
         reasons.append("run is not valid: " + "; ".join(results.get("invalid_reasons", [])))
     for i, s in enumerate(results["sentences"], 1):
-        if s["cer"] is None or s["cer"] > CER_MAX + EPS:
+        if s["status"] not in VALID:
+            reasons.append(f"sentence {i} invalid: {s['status']}")
+        elif s["cer"] is None or s["cer"] > CER_MAX + EPS:
             reasons.append(f"sentence {i}: cer {s['cer']} > {CER_MAX}")
     med, bmed = results["summary"].get("median_latency_s"), baseline_median(baseline)
     if med is None or bmed is None:
@@ -321,7 +360,9 @@ def report(res):
             print(f"sentence {k}: not_run")
     if not bad and not sm["invalid"]:
         print("none")
-    print(f"attempts used: {res['attempts_used']} of {res['accept_rotation']}")
+    extra = res.get("unprompted_dictations")
+    print(f"attempts used: {res['attempts_used']}; dictations counted against the rotation budget: "
+          f"{res['rotation_used']} of {res['accept_rotation']}" + (f" ({extra} unprompted)" if extra else ""))
     rec = res["recordings"]
     if rec:
         print("\n== Recordings")
@@ -426,6 +467,14 @@ def self_test():
         eq("level unreadable raises", False, True)
     except Exception:
         eq("level unreadable raises", True, True)
+    p_trunc = os.path.join(d, "trunc.wav")
+    write_wav(p_trunc, tone(3, -20))
+    os.truncate(p_trunc, os.path.getsize(p_trunc) // 2)
+    try:
+        level(p_trunc)
+        eq("level truncated raises", False, True)
+    except ValueError as ex:
+        eq("level truncated raises", str(ex), "truncated wav")
 
     # evaluation: audio validity + hallucination guard + accuracy
     good = {"status": "transcribed", "reason": "", "held_s": 6.1, "audio_s": 6.1, "latency_s": 0.7, "hyp": s}
@@ -464,7 +513,13 @@ def self_test():
     record(st, 2, {"status": "no_dictation_timeout", "reason": ""})
     eq("plan budget exhausted stops", plan(st, 2), ("stop", ""))
     eq("plan stays stopped", plan(st, 3), ("stop", ""))
-    eq("plan stop reason", st["stopped"], "rotation budget used up (2 attempts)")
+    eq("plan stop reason", st["stopped"], "rotation budget used up (2 of 2 dictations)")
+    st = new_state("t", "save-baseline", 3, refs)
+    observe(st, T("sending 6.10s of audio (1 bytes)", "TEXT (0.70s from release to paste): x"))
+    record(st, 1, {"status": "valid", "reason": "", "audio_s": 6.1})
+    observe(st, T(START_MSG, "sending 2.00s of audio (1 bytes)", "sending 3.00s of audio (1 bytes)"))
+    eq("plan unprompted uploads count", (plan(st, 2), st["rotation_used"]), (("stop", ""), 3))
+    eq("unprompted dictations reported", build_results(st)["unprompted_dictations"], 2)
     st = new_state("t", "save-baseline", 12, refs)
     record(st, 1, {"status": "error_hs_timeout", "reason": ""})
     eq("plan hs timeout retried once", plan(st, 1)[0], "run")
@@ -498,13 +553,22 @@ def self_test():
     eq("decide fail latency", decide(r, {"summary": {"median_latency_s": 1.7}})[0], False)
     eq("decide fail accuracy", decide(build_results(run_of("valid", "accuracy_fail", "valid")),
                                       {"summary": {"median_latency_s": 5.0}})[0], False)
-    eq("decide fail invalid run", decide(build_results(run_of("valid", "valid", "invalid_silent")),
-                                         {"summary": {"median_latency_s": 5.0}})[0], False)
+    ok_, why = decide(build_results(run_of("valid", "valid", "invalid_silent")), {"summary": {"median_latency_s": 5.0}})
+    eq("decide fail invalid run", ok_, False)
+    eq("decide reports invalid, not accuracy", ("sentence 3 invalid: invalid_silent" in why,
+                                                 any("cer" in w for w in why)), (True, False))
     edge = run_of("valid", "valid", "valid")
     for sn in edge["sentences"]:
         sn["attempts"][-1]["cer"] = 0.15
     eq("decide cer at limit", decide(build_results(edge), {"summary": {"median_latency_s": 5.0}})[0], True)
     eq("decide no baseline latency", decide(r, {"summary": {"median_latency_s": None}})[0], False)
+    eq("baseline ok", baseline_problem({"valid": True, "summary": {"median_latency_s": 0.7}}), "")
+    for name, b in (("invalid", {"valid": False, "summary": {"median_latency_s": 0.7}}),
+                    ("missing median", {"valid": True, "summary": {}}),
+                    ("string median", {"valid": True, "summary": {"median_latency_s": "0.7"}}),
+                    ("bool median", {"valid": True, "summary": {"median_latency_s": True}}),
+                    ("summary not a dict", {"valid": True, "summary": [1]}), ("not a dict", [1])):
+        eq(f"baseline rejected: {name}", baseline_problem(b) != "", True)
 
     print("helper self-test: " + ("PASS" if all(checks) else "FAIL"))
     return 0 if all(checks) else 1
@@ -523,6 +587,7 @@ def env_seconds(name, default):
 HS_TIMEOUT_S = env_seconds("SMOKE_HS_TIMEOUT_S", 5.0)
 POLL_INTERVAL_S = env_seconds("SMOKE_POLL_INTERVAL_S", 1.0)
 LEVEL_WAIT_S = env_seconds("SMOKE_LEVEL_WAIT_S", 3.0)
+MTIME_SLACK_S = 2.0  # clock slack when checking that a recording is newer than its attempt
 START_GRACE_S = 60.0  # once a dictation has started, allow this long for it to finish
 
 # Read-only Lua. Polling reads only the last 40 log entries, with newlines escaped.
@@ -626,8 +691,11 @@ def end_state():
     except OSError as ex:
         running = False
         print(f"dictation-recorder process: unknown ({ex})")
-    if st != "false false" or running:
+    if running or (st is not None and st != "false false"):
         print("NOTE: dictation is not idle. This script never stops or kills it; check it by hand.")
+    elif st is None:
+        print("NOTE: dictation state unknown (Hammerspoon not reachable). This script never stops or "
+              "kills it; check it by hand.")
     sys.stdout.flush()
 
 def sha256(path):
@@ -659,18 +727,25 @@ def backup_recordings(rec_dir, backup):
 def tail_log():
     return [l for l in hs(CMD_TAIL).split("\n") if l.strip()]
 
-def find_recording(prev):
-    """The newly archived WAV: copied asynchronously, so wait up to LEVEL_WAIT_S for it."""
+def fresh(p, since):
+    return os.path.getmtime(p) >= since - MTIME_SLACK_S
+
+def find_recording(prev, since):
+    """The newly archived WAV: copied asynchronously, so wait up to LEVEL_WAIT_S for it. It must
+    differ from the pre-attempt pointer and be written after the attempt started (wall clock)."""
     deadline = time.monotonic() + LEVEL_WAIT_S
     while True:
         try:
             p = hs_value(CMD_LASTREC)
         except HsError as ex:
             return None, str(ex)
-        if p and p != "nil" and p != prev and os.path.isfile(p) and os.path.getsize(p) > 0:
+        exists = bool(p) and p != "nil" and os.path.isfile(p) and os.path.getsize(p) > 0
+        if exists and p != prev and fresh(p, since):
             return p, ""
         if time.monotonic() >= deadline:
-            return None, ("_G.lastRecording did not change" if p == prev
+            if p == prev:
+                return None, "_G.lastRecording did not change"
+            return None, (f"archived recording {p} is older than this attempt" if exists
                           else f"archived recording {p} missing or empty")
         time.sleep(min(0.2, LEVEL_WAIT_S))
 
@@ -683,18 +758,30 @@ def show_sentence(st, k, msg):
     if not guide_text(st.get("doc"), text):
         print("(could not update the TextEdit document; read the sentence above)", flush=True)
 
-def run_attempt(st, k, msg, stop_path, timeout_s):
-    """Wait for one dictation. Returns the attempt dict, or None when asked to stop."""
-    hs_fail = lambda ex, what: {"status": "error_hs_timeout", "reason": f"{ex} while {what}", "held_s": None,
-                                "audio_s": None, "latency_s": None, "hyp": None}
+def hs_fail(ex, what):
+    return {"status": "error_hs_timeout", "reason": f"{ex} while {what}", "held_s": None,
+            "audio_s": None, "latency_s": None, "hyp": None}
+
+def sync(st):
+    """Catch up with the log before an attempt. Uploads since the previous attempt were not
+    prompted, but they rotate recordings too. Returns an HsError, or None."""
     try:
-        anchor = tail_log()
+        tail = tail_log()
     except HsError as ex:
-        return hs_fail(ex, "reading the log")
+        return ex
+    if "anchor" in st:
+        observe(st, new_entries(st["anchor"], tail))
+    st["anchor"] = tail
+    return None
+
+def run_attempt(st, k, msg, stop_path, timeout_s):
+    """Wait for one dictation, right after sync(). Returns the attempt dict, or None when asked
+    to stop."""
+    started = time.time()
     try:
         prev = hs_value(CMD_LASTREC)
     except HsError:
-        prev = "?"
+        prev = None  # unknown: a stale pointer could not be told from a new recording
     show_sentence(st, k, msg)
     deadline = time.monotonic() + timeout_s
     extended, acc = False, []
@@ -707,8 +794,10 @@ def run_attempt(st, k, msg, stop_path, timeout_s):
             after = tail_log()
         except HsError as ex:
             return hs_fail(ex, "polling the log")
-        acc += new_entries(anchor, after)
-        anchor = after
+        chunk = new_entries(st["anchor"], after)
+        observe(st, chunk)
+        acc += chunk
+        st["anchor"] = after
         a = classify(acc, now >= deadline)
         if a["status"] != "pending":
             break
@@ -716,7 +805,10 @@ def run_attempt(st, k, msg, stop_path, timeout_s):
             extended, deadline = True, max(deadline, now + START_GRACE_S)
     if a["status"] == "transcribed":
         time.sleep(min(1.0, POLL_INTERVAL_S))  # ~1 s after the TEXT line
-        wav, err = find_recording(prev)
+        if prev is None:
+            wav, err = None, "pre-attempt pointer unknown"
+        else:
+            wav, err = find_recording(prev, started)
         lvl = None
         if wav:
             try:
@@ -735,11 +827,19 @@ def attempts(st, stop_path, timeout_s):
             action, msg = plan(st, k)
             if action != "run":
                 break
-            att = run_attempt(st, k, msg, stop_path, timeout_s)
+            err = sync(st)
+            if err is None:
+                action, msg = plan(st, k)  # unprompted dictations since the last attempt count too
+                if action != "run":
+                    break
+                att = run_attempt(st, k, msg, stop_path, timeout_s)
+            else:
+                att = hs_fail(err, "reading the log")
             if att is None:
                 return False
             att = record(st, k, att)
-            print(f"  -> attempt #{att['n']} of {st['accept_rotation']}: {att['status']}"
+            print(f"  -> attempt #{att['n']} ({st['rotation_used']} of {st['accept_rotation']} dictations "
+                  f"used): {att['status']}"
                   + (f" ({att['reason']})" if att["reason"] else "")
                   + (f" cer={att['cer']}" if att.get("cer") is not None else ""), flush=True)
         if action == "stop":
@@ -804,6 +904,8 @@ def main(argv):
     cmd = argv[1]
     if cmd == "self-test":
         return self_test()
+    if cmd == "check-baseline":
+        return check_baseline(argv[2])
     if cmd == "run":  # run <mode> <budget> <attempt timeout s> <baseline|-> <baseline dir> <stop file> <ref>...
         try:
             return run(argv[2], int(argv[3]), float(argv[4]), argv[5], argv[6], argv[7], argv[8:])
@@ -864,9 +966,13 @@ if ! [[ "$attempt_timeout" =~ ^[0-9]+$ ]] || [ "$attempt_timeout" -lt 1 ]; then
   exit 2
 fi
 attempt_timeout="${SMOKE_ATTEMPT_TIMEOUT_S:-$attempt_timeout}"
-if [ "$mode" = compare ] && [ ! -f "$baseline_file" ]; then
-  echo "precondition: --baseline needs an existing results.json" >&2
-  exit 2
+if [ "$mode" = compare ]; then
+  if [ ! -f "$baseline_file" ]; then
+    echo "precondition: --baseline needs an existing results.json" >&2
+    exit 2
+  fi
+  # Checked now, before the backup and any dictation, not after the owner has read every sentence.
+  py check-baseline "$baseline_file" || exit 2
 fi
 
 # --- the run: preconditions, recordings backup, guided attempts, report, save or compare ----

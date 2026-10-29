@@ -310,7 +310,9 @@ if [ $rc -eq 0 ] && ! grep -q '^FAIL' <<< "$sout"; then ok "$t"; else fail "$t" 
 # --- guided dictation smoke with stubs ------------------------------------------------
 # A STATEFUL hs stub simulates Ben dictating. Every log poll prints the current log (last 40)
 # and then appends the next scenario step ($GS/steps/<n>, one file per poll), so the log grows
-# over successive polls. "!lastrec <path>" sets _G.lastRecording. The stub uses shell builtins
+# over successive polls. "!lastrec <path>" sets _G.lastRecording and touches the file (it was just
+# archived); "!lastrec_stale <path>" sets it without touching. "!lastrec_down" makes the next
+# _G.lastRecording read fail once; "!down" makes every later call fail. The stub uses shell builtins
 # where it can: process spawns, not sleeps, dominate the suite's run time. Every hs and
 # osascript call is logged. Forbidden binaries on PATH record any use. Fake HOME throughout:
 # nothing here reaches the real Hammerspoon, mic, speakers, TextEdit or clipboard.
@@ -325,6 +327,7 @@ cat > "$g_bin/hs" <<'SH'
 d="${GUIDED_STUB_DIR:?}"
 [ "${1:-}" = "-c" ] || { echo "stub hs: expected -c" >&2; exit 64; }
 printf '%s\n' "${2//$'\n'/\\n}" >> "$d/hs_calls"
+[ -f "$d/down" ] && { echo "error: can't access Hammerspoon message port" >&2; exit 69; }
 case "$2" in
   *'#_G.dictationLog'*)
     [ -f "$d/hang" ] && exec sleep 30
@@ -334,14 +337,19 @@ case "$2" in
     read -r c < "$d/count"
     while IFS= read -r line; do
       case "$line" in
-        '!lastrec '*) printf '%s\n' "${line#!lastrec }" > "$d/lastrec" ;;
+        '!lastrec '*) printf '%s\n' "${line#!lastrec }" > "$d/lastrec"; touch "${line#!lastrec }" ;;
+        '!lastrec_stale '*) printf '%s\n' "${line#!lastrec_stale }" > "$d/lastrec" ;;
+        '!lastrec_down') : > "$d/lastrec_down" ;;
+        '!down') : > "$d/down" ;;
         *) c=$((c + 1)); printf '10:%02d:%02d %s\n' $((c / 60)) $((c % 60)) "$line" >> "$d/dictlog" ;;
       esac
     done < "$d/steps/$n"
     echo "$c" > "$d/count" ;;
   *'type(_G.dictationLog)'*) read -r v < "$d/logtype"; echo "$v" ;;
   *'isPrimedOrRecording'*) read -r v < "$d/busy"; echo "$v" ;;
-  *'_G.lastRecording'*) read -r v < "$d/lastrec"; echo "$v" ;;
+  *'_G.lastRecording'*)
+    if [ -f "$d/lastrec_down" ]; then rm -f "$d/lastrec_down"; exit 69; fi
+    read -r v < "$d/lastrec"; echo "$v" ;;
   *) echo "stub hs: unexpected command: $2" >&2; exit 65 ;;
 esac
 SH
@@ -390,6 +398,9 @@ def tone(sec):
 write("tone.wav", tone(3))
 write("silent.wav", [0] * 48000)
 write("burst.wav", [0] * 160000 + tone(0.5))
+write("trunc.wav", tone(3))  # the header claims 3 s; cut to half
+p = os.path.join(sys.argv[1], "trunc.wav")
+os.truncate(p, os.path.getsize(p) // 2)
 PY
 }
 g_wavs_dir="$work/guided-wavs"; mkdir -p "$g_wavs_dir"; g_wavs "$g_wavs_dir"
@@ -440,7 +451,7 @@ g_fail() {  # g_fail <lines after the upload...>
 }
 # g_json <results.json> <python assertion expr over r>
 g_json() { python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if eval(sys.argv[2]) else 1)' "$1" "$2"; }
-g_one() { ls "$GBL"/$1/results.json 2>/dev/null | head -n 1; }
+g_one() { ls "$GBL"/$1/results.json 2>/dev/null | head -n 1 || true; }
 g_stat() { printf 'rc=%s\n%s\n' "$GRC" "$GOUT" | tail -n 40; }
 
 t=guided_valid_run_saves_baseline
@@ -525,9 +536,84 @@ g_run --accept-rotation 2 --save-baseline --attempt-timeout 10
 res="$(g_one 'invalid-*')"
 if [ $GRC -eq 1 ] && [ -n "$res" ] && ! ls -d "$GBL"/2* >/dev/null 2>&1 \
    && g_json "$res" 'r["attempts_used"]==2 and not r["valid"] and [s["status"] for s in r["sentences"]]==["invalid_silent","not_run","not_run"]' \
-   && grep -q 'NOT saved as baseline: rotation budget used up (2 attempts)' <<< "$GOUT" \
+   && grep -q 'NOT saved as baseline: rotation budget used up (2 of 2 dictations)' <<< "$GOUT" \
    && [ "$(grep -c 'from release to paste' "$GS/dictlog")" = 2 ]; then ok "$t"
 else fail "$t" "$(g_stat)"; fi
+
+t=guided_stale_pointer_after_hs_failure_not_measured
+# Attempt 2: the pre-attempt read of _G.lastRecording fails and the pointer never moves off
+# attempt 1's WAV. Attempt 3: the pointer moves to a WAV written long before the attempt.
+g_env "$t"; g_dict "$G1"
+g_step "!lastrec_down" "priming: opening mic on first modifier key" "$G_START"
+g_step "stop() heldFor=6.10" "sending 6.10s of audio (195244 bytes)"
+g_step "curl exited code=0" "TEXT (0.70s from release to paste): $G2"; g_step
+old="$GS/wavs/old.wav"; cp "$g_wavs_dir/tone.wav" "$old"; touch -t 202001010000 "$old"
+g_step "$G_START"; g_step "stop() heldFor=6.10" "sending 6.10s of audio (195244 bytes)" "!lastrec_stale $old"
+g_step "curl exited code=0" "TEXT (0.70s from release to paste): $G3"; g_step
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+res="$(ls "$GBL"/2*/results.json 2>/dev/null | head -n 1)"
+if [ $GRC -eq 0 ] && [ -n "$res" ] \
+   && g_json "$res" 'r["valid"] and r["sentences"][0]["flags"]==[] and abs(r["sentences"][0]["mean_db"]+20)<0.2 and all(s["status"]=="valid" and s["flags"]==["level_unknown"] and s["mean_db"] is None for s in r["sentences"][1:]) and "pre-attempt pointer unknown" in r["sentences"][1]["reason"] and "older than this attempt" in r["sentences"][2]["reason"]'; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_truncated_wav_level_unknown
+g_env "$t"; g_dict "$G1" trunc; g_dict "$G2"; g_dict "$G3"
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+res="$(ls "$GBL"/2*/results.json 2>/dev/null | head -n 1)"
+if [ $GRC -eq 0 ] && [ -n "$res" ] \
+   && g_json "$res" 'r["valid"] and r["sentences"][0]["flags"]==["level_unknown"] and r["sentences"][0]["mean_db"] is None and r["sentences"][0]["reason"].endswith("truncated wav") and r["sentences"][1]["flags"]==[]'; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_stray_dictations_count_against_rotation
+# One unprompted dictation in the same poll as attempt 1's result, another before attempt 2:
+# with N=3 the budget is used up, so sentence 2 is never prompted.
+g_env "$t"; cp "$g_wavs_dir/tone.wav" "$GS/wavs/a1.wav"
+g_step "$G_START"; g_step "stop() heldFor=6.10" "sending 6.10s of audio (195244 bytes)" "!lastrec $GS/wavs/a1.wav"
+g_step "curl exited code=0" "TEXT (0.70s from release to paste): $G1" \
+       "$G_START" "stop() heldFor=3.00" "sending 3.00s of audio (96044 bytes)" "curl exited code=0" "TEXT (0.60s from release to paste): stray"
+g_step "$G_START" "stop() heldFor=2.00" "sending 2.00s of audio (64044 bytes)" "curl exited code=0" "TEXT (0.60s from release to paste): stray 2"
+g_dict "$G2"; g_dict "$G3"
+g_run --accept-rotation 3 --save-baseline --attempt-timeout 10
+res="$(g_one 'invalid-*')"
+if [ $GRC -eq 1 ] && [ -n "$res" ] && ! ls -d "$GBL"/2* >/dev/null 2>&1 \
+   && g_json "$res" 'r["attempts_used"]==1 and r["rotation_used"]==3 and r["unprompted_dictations"]==2 and not r["valid"] and [s["status"] for s in r["sentences"]]==["valid","not_run","not_run"]' \
+   && grep -q 'rotation budget used up (3 of 3 dictations)' <<< "$GOUT" \
+   && grep -q 'dictations counted against the rotation budget: 3 of 3 (2 unprompted)' <<< "$GOUT" \
+   && ! grep -q 'Sentence 2 of 3' "$GS/osa_calls"; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_compare_rejects_invalid_baseline
+g_env "$t"; g_dict "$G1"
+printf '{"valid": false, "summary": {"median_latency_s": 0.7}}' > "$work/$t/invalid.json"
+g_run --accept-rotation 3 --baseline "$work/$t/invalid.json" --attempt-timeout 10
+if [ $GRC -eq 2 ] && grep -q 'not a valid run' <<< "$GOUT" && [ -z "$(ls -A "$GBL" 2>/dev/null)" ] \
+   && [ ! -s "$GS/hs_calls" ] && [ ! -s "$GS/osa_calls" ]; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_compare_rejects_malformed_baseline
+g_env "$t"; g_dict "$G1"
+printf '{"valid": true, "summary": ' > "$work/$t/truncated.json"
+printf '{"valid": true, "summary": {"median_latency_s": "fast"}}' > "$work/$t/string.json"
+ok_all=1
+for b in truncated string; do
+  g_run --accept-rotation 3 --baseline "$work/$t/$b.json" --attempt-timeout 10
+  if [ $GRC -ne 2 ] || ! grep -q '^precondition: --baseline' <<< "$GOUT" || grep -q Traceback <<< "$GOUT"; then ok_all=0; fi
+done
+if [ $ok_all -eq 1 ] && [ -z "$(ls -A "$GBL" 2>/dev/null)" ] && [ ! -s "$GS/hs_calls" ] && [ ! -s "$GS/osa_calls" ]; then ok "$t"
+else fail "$t" "$(g_stat)"; fi
+
+t=guided_decide_reports_invalid_not_accuracy
+# Sentence 3 is too short three times; Hammerspoon then goes away, so the end state is unknown.
+g_env "$t"; g_dict "$G1"; g_dict "$G2"; g_short; g_short
+g_step "$G_START"; g_step "stop() heldFor=0.20" "held only 0.20s, ignoring"; g_step "!down"
+printf '{"valid": true, "summary": {"median_latency_s": 5.0}}' > "$work/$t/baseline.json"
+g_run --accept-rotation 5 --baseline "$work/$t/baseline.json" --attempt-timeout 10
+dec="$(cat "$GBL"/compare-*/decision.txt 2>/dev/null || true)"
+if [ $GRC -eq 1 ] && grep -qx 'FAIL sentence 3 invalid: invalid_short' <<< "$dec" && ! grep -q 'cer' <<< "$dec" \
+   && grep -qx 'RESULT: FAIL' <<< "$dec" \
+   && grep -q 'NOTE: dictation state unknown (Hammerspoon not reachable)' <<< "$GOUT" \
+   && ! grep -q 'dictation is not idle' <<< "$GOUT"; then ok "$t"
+else fail "$t" "$dec $(g_stat)"; fi
 
 t=guided_refuses_without_accept_rotation
 g_env "$t"; g_dict "$G1"
