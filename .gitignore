@@ -8,3 +8,14 @@ bin/dictation-recorder
 recordings/
 *.wav
 .DS_Store
+# future secrets and local data (meeting notetaker)
+.env
+.env.*
+.dev.vars
+node_modules/
+.wrangler/
+*.m4a
+*.aiff
+*notetaker-device-token*
+baseline/
+spool/
