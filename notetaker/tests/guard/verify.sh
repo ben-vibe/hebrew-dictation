@@ -30,6 +30,7 @@ set -e
 
 python3 - "$base_dir/snapshot.txt" "$fresh" "$base_dir/init.lua.copy" "$HOME/.hammerspoon/init.lua" <<'PY'
 import sys
+from collections import Counter
 
 PCALL = b'pcall(require, "notetaker") -- meeting notetaker; delete this line to remove it completely'
 MODS = {"⌘", "⌃", "⌥"}
@@ -106,25 +107,22 @@ for path in sorted(set(bf) | set(ff)):
     else:
         report(False, f"file {path}", "content changed")
 
-def multiset_diff(a, b):
-    rest = list(b)
-    for x in a:
-        if x in rest:
-            rest.remove(x)
-        else:
-            return None
-    return rest
-
-if fh == bh:
+# Hotkeys are a multiset: the same idx bound twice is a real (and suspicious) change.
+bc, fc = Counter(bh), Counter(fh)
+added, removed = fc - bc, bc - fc
+dups = sorted(h for h, n in fc.items() if n > 1 and n > bc[h])
+if not added and not removed:
     report(True, "hotkeys", f"{len(bh)} unchanged")
+elif not removed and sum(added.values()) == 1 and not dups \
+        and is_notetaker_hotkey(next(iter(added))):
+    report(True, "hotkeys", f"{len(bh)} unchanged + notetaker {next(iter(added))}")
 else:
-    extra = multiset_diff(bh, fh)
-    if extra is not None and len(extra) == 1 and is_notetaker_hotkey(extra[0]):
-        report(True, "hotkeys", f"{len(bh)} unchanged + notetaker {extra[0]}")
-    else:
-        removed = [h for h in bh if h not in fh]
-        added = [h for h in fh if h not in bh]
-        report(False, "hotkeys", f"added: {' '.join(added) or '-'}; removed: {' '.join(removed) or '-'}")
+    note = f"added: {' '.join(sorted(added.elements())) or '-'}; " \
+           f"removed: {' '.join(sorted(removed.elements())) or '-'}"
+    if dups:
+        note += "; duplicate binding of an existing combo: " + " ".join(
+            f"{h} x{fc[h]}" for h in dups)
+    report(False, "hotkeys", note)
 
 for key in sorted(set(bo) | set(fo)):
     b, f = bo.get(key), fo.get(key)

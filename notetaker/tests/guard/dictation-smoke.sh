@@ -215,6 +215,19 @@ if [ "$src_count" != "$dst_count" ]; then
 fi
 echo "recordings backed up: $dst_count file(s) -> $backup"
 
+# SAFETY: once startRecording has been called, any error, Ctrl-C or kill must still stop the
+# recording, or dictation is left recording with the mic open. TextEdit is brought back to the
+# front first so the transcript pastes into the scratch document, not wherever focus went.
+emergency_stop() {
+  local rc="$1"
+  trap - ERR INT TERM
+  echo "aborting (rc=$rc): stopping the dictation recording" >&2
+  osascript -e 'tell application "TextEdit" to activate' >/dev/null 2>&1 || true
+  "$HS_BIN" -c '_G.stopRecordingAndTranscribe()' >/dev/null 2>&1 || true
+  exit "$rc"
+}
+set -E  # let the ERR trap fire inside functions too
+
 CMD_DUMP_LOG='for _,l in ipairs(_G.dictationLog or {}) do print((l:gsub("\n", "\\n"))) end'
 
 dump_log() { "$HS_BIN" -c "$CMD_DUMP_LOG" > "$1"; }
@@ -244,6 +257,10 @@ for sentence in "${SENTENCES[@]}"; do
   dump_log "$before"
   echo "  log length before: $(wc -l < "$before" | tr -d ' ')"
 
+  # Armed before the call: if startRecording itself half-fails we still stop (a no-op if idle).
+  trap 'emergency_stop $?' ERR
+  trap 'emergency_stop 130' INT
+  trap 'emergency_stop 143' TERM
   "$HS_BIN" -c '_G.startRecording()' >/dev/null
   if ! poll_log "$before" "mic READY" 3 >/dev/null; then
     echo "  WARN: no 'mic READY' within 3 s; continuing"
@@ -252,6 +269,7 @@ for sentence in "${SENTENCES[@]}"; do
   say -v Carmit "$sentence"
   sleep 0.4
   "$HS_BIN" -c '_G.stopRecordingAndTranscribe()' >/dev/null
+  trap - ERR INT TERM
 
   line=""
   if ! line="$(poll_log "$before" "TEXT (" 15)"; then
@@ -281,7 +299,15 @@ case "$mode" in
     echo "$out_dir/results.json"
     ;;
   compare)
-    python3 "$helper" decide "$results" "$baseline_file"
+    out_dir="$BASELINE_DIR/compare-$ts"
+    mkdir -p "$out_dir"
+    cp "$results" "$out_dir/results.json"
+    set +e
+    python3 "$helper" decide "$results" "$baseline_file" | tee "$out_dir/decision.txt"
+    rc=${PIPESTATUS[0]}
+    set -e
+    echo "compare results: $out_dir"
+    exit "$rc"
     ;;
   *)
     out="$BASELINE_DIR/smoke-$ts.json"
